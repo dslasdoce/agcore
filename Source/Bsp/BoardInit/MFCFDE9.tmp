@@ -1,0 +1,649 @@
+/********************************************************************************
+  * @file      	port.c
+  * @author		Hardware Team
+  * @version	v2.2
+  * @date		
+  * @brief
+  ******************************************************************************
+  * @attention
+  *
+  * COPYRIGHT(c) 2015 AgTech Labs, Inc.
+  *
+  * Redistribution and use in source and binary forms, with or without modification,
+  * are permitted provided that the following conditions are met:
+  *   1. Redistributions of source code must retain the above copyright notice,
+  *      this list of conditions and the following disclaimer.
+  *   2. Redistributions in binary form must reproduce the above copyright notice,
+  *      this list of conditions and the following disclaimer in the documentation
+  *      and/or other materials provided with the distribution.
+  *   3. Neither the name of AgTech Labs, Inc. nor the names of its contributors
+  *      may be used to endorse or promote products derived from this software
+  *      without specific prior written permission.
+  *
+  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  *
+  ******************************************************************************
+  */
+
+
+/* Includes ==================================================================*/
+#include "port.h"
+#include "isrMain.h"
+#include "intFlash.h"
+#include "delay.h"
+#include "agBoardInit.h"
+#include "port.h"
+
+/* Defines ===================================================================*/
+#define CODE_MUXID_COUNT 			((uint8_t)4)
+#define SIZE_SENSOR_ID				((uint8_t)20)
+#define CODE_MUXRES_75				((uint8_t)0x00)
+#define CODE_MUXRES_360				((uint8_t)0x01)
+#define CODE_MUXRES_10k				((uint8_t)0x02)
+#define CODE_MUXRES_PULLUP			((uint8_t)0x03)
+#define MAX_CURRENT_5mA				((uint8_t)5)
+#define MAX_CURRENT_20mA			((uint8_t)20)
+#define MAXSIZE_SR_S 				((uint32_t)32)
+#define MAXSIZE_SR_L 				((uint32_t)64)
+
+/* Global Declarations =======================================================*/
+uint32_t sr_next_free_address = ADDR_FLASH_SECTOR_5;
+const uint32_t sr_max_address = ADDR_FLASH_SECTOR_5 +
+								sizeof(SensorRegistrationStruct)*10;
+
+/* External Declarations =====================================================*/
+extern PortConfigStruct PortConfig;
+
+/* Functions =================================================================*/
+
+#ifndef __RTCTIMER__
+/*============================================================================
+ * @brief
+ * @param
+ * @retval
+============================================================================*/
+static void portEnableDaq(SensorRegistrationStruct *sensordetails_ptr)
+{
+	if(sensordetails_ptr->status == true)
+		switch(sensordetails_ptr->port)
+		{
+			case 1:
+				HAL_NVIC_EnableIRQ(DAQTIM_P1_IRQn);
+				break;
+			case 2:
+				HAL_NVIC_EnableIRQ(DAQTIM_P2_IRQn);
+				break;
+			case 3:
+				HAL_NVIC_EnableIRQ(DAQTIM_P3_IRQn);
+				break;
+			case 4:
+				HAL_NVIC_EnableIRQ(DAQTIM_P4_IRQn);
+				break;
+			default:
+				return;
+		}
+}
+#endif
+
+/* ============================================================================
+ * @brief	save sensor registration value to flash
+ * ==========================================================================*/
+void portSRSave(void)
+{
+	if(sr_next_free_address == sr_max_address)
+	{
+		/*reset*/
+		sr_next_free_address = ADDR_FLASH_SECTOR_5;
+	}
+
+	if (intFlDmaExec((uint32_t)&PortConfig, sr_next_free_address,
+			   sizeof(SensorRegistrationStruct)) != SUCCESSFUL)
+	{
+	   assert(0);
+	   return;
+	}
+	sr_next_free_address += sizeof(PortConfigStruct);
+}
+
+void portSRRead(PortConfigStruct* dest_addr)
+{
+	intFlDmaExec(((sr_next_free_address == ADDR_FLASH_SECTOR_5) ?
+				sr_next_free_address: sr_next_free_address -
+				sizeof(PortConfigStruct)), (uint32_t)dest_addr,
+				sizeof(SensorRegistrationStruct));
+}
+
+#define MAX_SENSORPORT			((uint8_t)4)
+#define	PORT_INACTIVE			((uint8_t)0)
+#define	PORT_ACTIVE_A			((uint8_t)1)
+#define	PORT_ACTIVE_M			((uint8_t)3)
+
+/* ============================================================================
+ * @brief	scan for attached sensor for each port
+ * ==========================================================================*/
+void portScan(uint16_t *sensor_codes)
+{
+	uint8_t bitmask = 0x1;
+	gpioDigitalWrite(&ID_1OENB, LOW);
+	//uint16_t sensor_id = 0;
+	//bool is_sr_outdated = false;
+	for(uint8_t muxcode=0; muxcode<CODE_MUXID_COUNT; muxcode++)
+	{
+		/*muxcode bit 1 state*/
+		gpioDigitalWrite(&ID_SEL0, muxcode&bitmask);
+		/*muxcode bit 2 state*/
+		gpioDigitalWrite(&ID_SEL1, muxcode&(bitmask<<1));
+		if (!portReadID(sensor_codes + muxcode))
+			sensor_codes[muxcode] = 0;
+		oneWireReset(&ID_1WIRE);
+		delayMillis(100);
+
+	}
+	gpioDigitalWrite(&ID_1OENB, HIGH);
+}
+
+/*============================================================================
+ * @brief
+ * @param
+ * @retval
+============================================================================*/
+static bool portProcess(uint16_t *sensor_codes, SensorRegistrationStruct *sr_ptr)
+{
+	bool copy_stat = false;
+	for(uint8_t i = 0; i < MAX_SENSORPORT; i++)
+	{
+		if(sensor_codes[i] != 0)
+		{
+			/*new sensor id detected*/
+			if(sensor_codes[i] != sr_ptr->sensor_code)
+			{
+				/*driver search*/
+				/*copy from driver to port config*/
+				sr_ptr->status = PORT_ACTIVE_A;
+				copy_stat = true;
+			}
+			/*same sensor id detected*/
+			else
+			{
+				if(!(sr_ptr->status & 0x01))
+				{
+					/*driver search*/
+					/*copy from driver to port config*/
+					sr_ptr->status = PORT_ACTIVE_A;
+					copy_stat = true;
+				}
+
+			}
+		}
+		else
+		{
+			if(sr_ptr->status == PORT_ACTIVE_A ||
+				sr_ptr->status == PORT_ACTIVE_M)
+			{
+				sr_ptr->status = PORT_INACTIVE;
+				copy_stat = true;
+			}
+		}
+	++sr_ptr;
+	}
+	return copy_stat;
+}
+
+#ifdef	__HWTEST__
+/*============================================================================
+ * @brief
+ * @param
+ * @retval
+============================================================================*/
+void portInitTest()
+{
+	uint16_t sensor_codes[4];
+	PortConfigStruct PortConfigTEST;
+	memcpy(&PortConfig.P1, &PORT1_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P2, &PORT2_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P3, &PORT3_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P4, &PORT4_SENSOR, sizeof(SensorRegistrationStruct));
+	//portSRRead(&PortConfig);
+	/*Set True to activate port*/
+	PortConfig.P1.status = PORT1_ACTIVE;
+	PortConfig.P2.status = PORT2_ACTIVE;
+	PortConfig.P3.status = PORT3_ACTIVE;
+	PortConfig.P4.status = PORT4_ACTIVE;
+
+	PortConfig.P1.port = 1;
+	PortConfig.P1.sub_gpio = CTR1;
+
+	PortConfig.P2.sub_gpio = CTR2;
+	PortConfig.P2.port = 2;
+
+	PortConfig.P3.sub_gpio = CTR3;
+	PortConfig.P3.port = 3;
+
+	PortConfig.P4.sub_gpio = CTR4;
+	PortConfig.P4.port = 4;
+	//portSRRead(&PortConfig);
+	portScan(sensor_codes);
+	//if(portProcess(sensor_codes, (SensorRegistrationStruct*)&PortConfig))
+	//	portSRSave();
+	portSRRead(&PortConfigTEST);
+	while(1)
+	{
+		//portSRRead(&PortConfig);
+		portScan(sensor_codes);
+		PortConfig.P1.sensor_code += 5;
+		PortConfig.P2.sensor_code += 5;
+		//if(portProcess(sensor_codes, (SensorRegistrationStruct*)&PortConfig))
+		//	portSRSave();
+		//++sr_next_free_address;
+		portSRRead(&PortConfigTEST);
+		sr_next_free_address += sizeof(PortConfig);
+
+	}
+}
+#endif //__HWTEST__
+
+/* =============================================================================
+ * @brief	initialize each port
+ * ===========================================================================*/
+void portInit(void)
+{
+
+	/*Available drivers
+	 * DVIS_TMP_HMD, DVIS_TMP, DVIS_RAIN, WP_1000, HSTI_40,AQCHK */
+	uint16_t sensor_codes[4];
+	memcpy(&PortConfig.P1, &PORT1_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P2, &PORT2_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P3, &PORT3_SENSOR, sizeof(SensorRegistrationStruct));
+	memcpy(&PortConfig.P4, &PORT4_SENSOR, sizeof(SensorRegistrationStruct));
+
+	/*Set True to activate port*/
+	PortConfig.P1.status = PORT1_ACTIVE;
+	PortConfig.P2.status = PORT2_ACTIVE;
+	PortConfig.P3.status = PORT3_ACTIVE;
+	PortConfig.P4.status = PORT4_ACTIVE;
+
+	PortConfig.P1.port = 1;
+	PortConfig.P1.sub_gpio = CTR1;
+
+	PortConfig.P2.sub_gpio = CTR2;
+	PortConfig.P2.port = 2;
+
+	PortConfig.P3.sub_gpio = CTR3;
+	PortConfig.P3.port = 3;
+
+	PortConfig.P4.sub_gpio = CTR4;
+	PortConfig.P4.port = 4;
+	//portSRRead(&PortConfig);
+	//portScan(sensor_codes);
+	//if(portProcess(sensor_codes, (SensorRegistrationStruct*)&PortConfig))
+	//	portSRSave();
+	if(PortConfig.P1.status == true)
+	{
+		portSetup(&PortConfig.P1);
+		daqSetProcessingParams(&Port1Processing, &PortConfig.P1);
+	}
+
+	if(PortConfig.P2.status == true)
+	{
+		portSetup(&PortConfig.P2);
+		daqSetProcessingParams(&Port2Processing, &PortConfig.P2);
+	}
+
+	if(PortConfig.P3.status == true)
+	{
+		portSetup(&PortConfig.P3);
+		daqSetProcessingParams(&Port3Processing, &PortConfig.P3);
+	}
+
+	if(PortConfig.P4.status == true)
+	{
+		portSetup(&PortConfig.P4);
+		daqSetProcessingParams(&Port4Processing, &PortConfig.P4);
+	}
+
+ 	delayMillis(500);
+ 	#ifndef __RTCTIMER__
+		portEnableDaq(&PortConfig.P1);
+		portEnableDaq(&PortConfig.P2);
+		portEnableDaq(&PortConfig.P3);
+		portEnableDaq(&PortConfig.P4);
+	#endif
+}
+
+/* ============================================================================
+ * @brief 	turn off the power on the port
+ * @param 	port: port number where the power will be cut
+ * ==========================================================================*/
+void portPowerReset(uint8_t port)
+{
+	delayMillis(200);
+	uint8_t pin,i;
+	uint8_t udelay = 100;
+	pin = (port-1)*3;
+		for(i=pin; i<(pin+3);++i)
+		{
+			gpioDigitalWrite(&(AgTechIOStruct){GPIOG,i}, LOW);
+		}
+		delayMicros(udelay);
+}
+
+/* ============================================================================
+ * @brief	turn on power on the port
+ * @param	port: port number where the power will be cut
+ * @param	suuply_code: indicates the hex code of the supply to be used
+ * ==========================================================================*/
+void portPowerSet(uint8_t port, float supply)
+{
+	uint8_t pin;
+	uint8_t supply_code;
+	if(supply <= 3.3)
+		supply_code = 0;
+	else if(supply >= 3.3 && supply <= 5)
+		supply_code = 2;
+	else
+		supply_code = 1;
+	portPowerReset(port);
+	delayMillis(500);
+	pin = 3*(port - 1) + supply_code;
+	gpioDigitalWrite(&(AgTechIOStruct){GPIOG,pin}, HIGH);
+	delayMillis(500);
+}
+
+/* =============================================================================
+ * @brief	write sensor id to eeprom
+ * @param	id_str: string to be written
+ * ===========================================================================*/
+void portWriteID(uint16_t id)
+{
+	AgTechIOStruct *gpio = &ID_1WIRE;
+	uint8_t cmd_write_scratchpad = 0x0F;
+	uint8_t target_address[] = {0x00, 0x00};
+	uint8_t crc[2];
+	uint8_t addr[8];
+	uint8_t auth_code[3];
+	uint8_t data[8];
+	uint8_t id_str[8];
+	id_str[0] = id & 0xFF;
+	id_str[1] = id >> 8;
+	memset(data, 0, 8);
+	memset(crc, 0, 2);
+	uint16_t crc2 = 0;
+	//crc16(data, 16, crc2);
+	volatile uint8_t copy_status = 0;
+	volatile uint8_t search_result;
+	//uint8_t alldata[20];
+	//uint16_t crc_test = crc16(alldata, 10, 0)
+	search_result = oneWireSearch(gpio, addr);
+	if(!search_result)
+		return;
+
+	/*reset bus*/
+	oneWireReset(gpio);
+	/*skip rom*/
+	oneWireWrite(gpio, 0xCC, 0);
+	/*issue write scratchpad command*/
+	oneWireWrite(gpio, cmd_write_scratchpad, 0);
+	/*issue target address*/
+	oneWireWriteBytes(gpio, target_address,
+					  sizeof(target_address)/sizeof(uint8_t), 0);
+	/*issue data*/
+	oneWireWriteBytes(gpio, (uint8_t *)id_str, 8, 1);
+	/*read crc*/
+	oneWireReadBytes(gpio, crc, sizeof(crc)/sizeof(uint8_t));
+
+	/*reset bus*/
+	oneWireReset(gpio);
+	/*skip rom*/
+	oneWireWrite(gpio, 0xCC, 0);
+	/*issue read scratchpad command*/
+	oneWireWrite(gpio, 0xAA, 0);
+	/*read 3 byte auth code*/
+	oneWireReadBytes(gpio, auth_code, sizeof(auth_code)/sizeof(uint8_t));
+	/*read data*/
+	oneWireReadBytes(gpio, data, sizeof(data)/sizeof(uint8_t));
+	/*read crc*/
+	oneWireReadBytes(gpio, crc, sizeof(crc)/sizeof(uint8_t));
+
+	/*reset bus*/
+	oneWireReset(gpio);
+	/*skip rom*/
+	oneWireWrite(gpio, 0xCC, 0);
+	/*issue copy scratchpad command*/
+	oneWireWrite(gpio, 0x55, 0);
+	/*issue auth code*/
+	oneWireWriteBytes(gpio, auth_code,
+					  sizeof(auth_code)/sizeof(uint8_t), 0);
+	delayMillis(13);
+	copy_status = oneWireRead(gpio);
+	if(copy_status != 0xAA)
+		return;
+
+	oneWireReset(gpio);
+	/*skip rom*/
+	oneWireWrite(gpio, 0xCC, 1);
+	/*read memory*/
+	oneWireWrite(gpio, 0xF0, 1);
+	/*send target address*/
+	oneWireWriteBytes(gpio, target_address,
+					  sizeof(target_address)/sizeof(uint8_t), 1);
+	/*read data*/
+	oneWireReadBytes(gpio, data, 2);
+
+	oneWireReset(gpio);
+	//uint16_t xxx;
+	//delayMillis(1000);
+	//portReadID(&xxx);
+}
+
+/* ============================================================================
+ * @brief	read sensor id from eeprom
+ * ==========================================================================*/
+bool portReadID(uint16_t *id)
+{
+	AgTechIOStruct *gpio = &ID_1WIRE;
+	uint8_t data[2];
+	uint8_t target_address[] = {0x00, 0x00};
+	volatile uint8_t search_result;
+	uint8_t crc_code;
+	uint8_t addr[8];
+	delayMillis(100);
+
+
+	search_result = oneWireSearch(gpio, addr);
+	if (search_result)
+	{
+		crc_code = crc8(addr, 7);
+		if ( crc_code == addr[7])
+		{
+			oneWireReset(gpio);
+			/*skip rom*/
+			oneWireWrite(gpio, 0xCC, 0);
+			/*read memory*/
+			oneWireWrite(gpio, 0xF0, 0);
+			/*send target address*/
+			oneWireWriteBytes(gpio, target_address,
+							  sizeof(target_address)/sizeof(uint8_t), 0);
+			/*read data*/
+			oneWireReadBytes(gpio, data, sizeof(data)/sizeof(uint8_t));
+
+			oneWireReset(gpio);
+			//strncpy((char*)id_str, (char*)data, 8);
+			*id = data[1]<<8 | data[0];
+			return true;
+		}
+	}
+	return false;
+}
+
+/* ============================================================================
+ * @brief	configure which IO pin will be used by a port
+ * @param	pointer to port configuration
+ * ==========================================================================*/
+static void portSetIO(SensorRegistrationStruct *sensordetails_ptr)
+{
+	switch(sensordetails_ptr->port)
+	{
+		case 1:
+			if(sensordetails_ptr->interface == ANALOG ||
+				sensordetails_ptr->interface == ANALOG_W_CCTR ||
+				sensordetails_ptr->interface == ANALOG_W_PCTR ||
+				sensordetails_ptr->interface == DUAL_ANALOG)
+				sensordetails_ptr->gpio = AN1;
+			else
+				sensordetails_ptr->gpio = DIG1;
+			break;
+		case 2:
+			if(sensordetails_ptr->interface == ANALOG ||
+				sensordetails_ptr->interface == ANALOG_W_CCTR ||
+				sensordetails_ptr->interface == ANALOG_W_PCTR ||
+				sensordetails_ptr->interface == DUAL_ANALOG)
+				sensordetails_ptr->gpio = AN2;
+			else
+				sensordetails_ptr->gpio = DIG2;
+			break;
+		case 3:
+			if(sensordetails_ptr->interface == ANALOG ||
+				sensordetails_ptr->interface == ANALOG_W_CCTR ||
+				sensordetails_ptr->interface == ANALOG_W_PCTR ||
+				sensordetails_ptr->interface == DUAL_ANALOG)
+				sensordetails_ptr->gpio = AN3;
+			else
+				sensordetails_ptr->gpio = DIG3;
+			break;
+		case 4:
+			if(sensordetails_ptr->interface == ANALOG ||
+				sensordetails_ptr->interface == ANALOG_W_CCTR ||
+				sensordetails_ptr->interface == ANALOG_W_PCTR ||
+				sensordetails_ptr->interface == DUAL_ANALOG)
+				sensordetails_ptr->gpio = AN4;
+			else
+				sensordetails_ptr->gpio = DIG4;
+			break;
+		default:
+			break;
+	}
+}
+
+/* ============================================================================
+ * @brief setup signal path and IO to be used by a port
+ * @param	sensordetails_ptr: ptr to SensorRegistrationStruct
+ * ==========================================================================*/
+InterfaceStatusEnum portSetup(SensorRegistrationStruct *sensordetails_ptr)
+{
+	//const char *sensor_type_tp = "04";
+	const float voltage_steps = 1.5;
+	const uint32_t resistance_steps = 5000;
+	const uint32_t resistance_dpotmax = 90000;
+	//bool code_interface = 0;
+	volatile int vin_scaler = 0;
+	uint32_t code_muxres = CODE_MUXRES_10k;
+	uint32_t resistance_dpot = 0;
+	uint8_t port = sensordetails_ptr->port;
+	float sensor_output_max = sensordetails_ptr->raw_max;
+	InterfaceStatusEnum status = INTERFACE_OK;
+	char *strptr_ohm, *strptr_voltage, *strptr_current = NULL;
+	bool analog_en_state = true;
+	sigpathAnalogEn(sensordetails_ptr->port, false);
+	/*analog sensor*/
+	if(sensordetails_ptr->interface == ANALOG ||
+	   sensordetails_ptr->interface == ANALOG_W_CCTR ||
+	   sensordetails_ptr->interface == DUAL_ANALOG)
+	{
+		strptr_ohm = strstr(sensordetails_ptr->raw_uom, RAW_UOM_OHM);
+		strptr_voltage = strstr(sensordetails_ptr->raw_uom, RAW_UOM_V);
+		strptr_current = strstr(sensordetails_ptr->raw_uom, RAW_UOM_A);
+
+		/*sensor output is analog voltage*/
+		if(strptr_voltage)
+		{
+			/*voltage sensor is connected to exclusive analog pin*/
+			if(strptr_voltage == sensordetails_ptr->raw_uom)
+			{
+				vin_scaler = ceil(sensor_output_max / voltage_steps);
+				if (vin_scaler > 2)
+				{
+					resistance_dpot = (vin_scaler - 2)*resistance_steps;
+					code_muxres = CODE_MUXRES_10k;
+				}
+				else
+					analog_en_state = false;
+			}
+		}
+
+		/*sensor output is analog current*/
+		if(strptr_current)
+		{
+			if(strptr_current == sensordetails_ptr->raw_uom)
+			{
+			   resistance_dpot = 0;
+				if (sensor_output_max <= MAX_CURRENT_5mA)
+					code_muxres = CODE_MUXRES_360;
+				else if(sensor_output_max>MAX_CURRENT_5mA &&
+						sensor_output_max <= MAX_CURRENT_20mA)
+					code_muxres = CODE_MUXRES_75;
+				else
+				{
+					assert(0);
+					return INTERFACE_ERROR;
+				}
+			}
+
+			else
+			{
+				assert(0);
+				return INTERFACE_ERROR;
+			}
+		}
+
+		if(strptr_ohm)
+		{
+			if(strptr_ohm == sensordetails_ptr->raw_uom )
+			{
+				resistance_dpot = 0;
+				code_muxres = CODE_MUXRES_PULLUP;
+			}
+			else
+				assert(0);
+		}
+	}
+
+	/*digital sensor*/
+	else
+	{
+		code_muxres = CODE_MUXRES_10k;
+		resistance_dpot = resistance_dpotmax;
+		analog_en_state = false;
+	}
+
+	status = sigpathSet(port, code_muxres, sensordetails_ptr->interface,
+			resistance_dpot);
+	if(status == INTERFACE_OK)
+		portSetIO(sensordetails_ptr);
+	sigpathAnalogEn(sensordetails_ptr->port, analog_en_state);
+	return status;
+}
+
+/*******************************************************************************
+  * Revision History
+  *	@file       port.c
+  ******************************************************************************
+  * @version    v2.2.0
+  * @date       
+  * @author     D.Lasdoce
+  * @changes
+  ******************************************************************************
+  * @version
+  * @date
+  * @author
+  * @changes
+  ******************************************************************************
+  */
